@@ -1,13 +1,26 @@
 """
 model.py
 
-Hybrid SchNet + Multi-Head Transformer model
+Hybrid SchNet + Multi-Head Transformer
 for molecular energy and force prediction.
 
-The model predicts molecular energy and obtains
-atomic forces using automatic differentiation:
+Architecture:
 
-F = -grad(E)
+Atomic structure
+        |
+        v
+SchNet-style atom encoder
+        |
+        v
+Transformer attention
+        |
+        v
+Energy prediction
+        |
+        v
+Force calculation
+
+F = -dE/dR
 
 Project:
 Hybrid-SchNet-Transformer-MD17
@@ -25,9 +38,13 @@ import torch.nn as nn
 
 
 from torch_geometric.nn import (
-    SchNet,
+    MessagePassing,
+    radius_graph,
     global_add_pool,
 )
+
+
+from torch_geometric.nn.inits import glorot
 
 
 from transformer import TransformerEncoder
@@ -37,21 +54,264 @@ from config import config
 
 
 # ============================================================
-# Energy Prediction Head
+# Continuous Filter Layer
 # ============================================================
 
 
-class EnergyHead(nn.Module):
+class RadialFilter(nn.Module):
     """
-    Neural network regression head.
+    Learn distance-dependent interaction filters.
 
-    Converts molecular representation into energy.
+    This is the key idea behind SchNet:
+    molecular interactions depend on interatomic distances.
     """
 
 
     def __init__(
         self,
         hidden_dim: int,
+    ):
+
+        super().__init__()
+
+
+        self.network = nn.Sequential(
+
+            nn.Linear(1, hidden_dim),
+
+            nn.SiLU(),
+
+            nn.Linear(
+                hidden_dim,
+                hidden_dim,
+            )
+
+        )
+
+
+
+    def forward(
+        self,
+        distance: Tensor,
+    ) -> Tensor:
+
+
+        distance = distance.unsqueeze(-1)
+
+
+        return self.network(distance)
+
+
+
+
+# ============================================================
+# SchNet Interaction Block
+# ============================================================
+
+
+class SchNetInteraction(MessagePassing):
+    """
+    Simplified SchNet interaction block.
+
+    Atom features exchange information
+    through distance-based messages.
+    """
+
+
+    def __init__(
+        self,
+        hidden_dim: int,
+    ):
+
+        super().__init__(
+            aggr="add"
+        )
+
+
+        self.filter = RadialFilter(
+            hidden_dim
+        )
+
+
+        self.message_network = nn.Sequential(
+
+            nn.Linear(
+                hidden_dim,
+                hidden_dim,
+            ),
+
+            nn.SiLU(),
+
+            nn.Linear(
+                hidden_dim,
+                hidden_dim,
+            )
+
+        )
+
+
+
+        self.update = nn.Sequential(
+
+            nn.Linear(
+                hidden_dim,
+                hidden_dim,
+            ),
+
+            nn.SiLU(),
+
+        )
+
+
+
+
+    def forward(
+        self,
+        x: Tensor,
+        pos: Tensor,
+        edge_index: Tensor,
+    ) -> Tensor:
+
+
+        row, col = edge_index
+
+
+        distance = torch.norm(
+            pos[row]-pos[col],
+            dim=1,
+        )
+
+
+        return self.propagate(
+
+            edge_index,
+
+            x=x,
+
+            distance=distance,
+
+        )
+
+
+
+
+    def message(
+        self,
+        x_j: Tensor,
+        distance: Tensor,
+    ) -> Tensor:
+
+
+        filter_weight = self.filter(
+            distance
+        )
+
+
+        return x_j * filter_weight
+
+
+
+    def update(
+        self,
+        aggr_out: Tensor,
+    ) -> Tensor:
+
+
+        return self.update(
+            aggr_out
+        )
+
+
+
+
+# ============================================================
+# SchNet Encoder
+# ============================================================
+
+
+class SchNetEncoder(nn.Module):
+    """
+    Atom-level SchNet encoder.
+
+    Output:
+    one feature vector per atom.
+    """
+
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_interactions: int,
+    ):
+
+        super().__init__()
+
+
+        self.embedding = nn.Embedding(
+            100,
+            hidden_dim,
+        )
+
+
+        self.interactions = nn.ModuleList(
+
+            [
+
+                SchNetInteraction(
+                    hidden_dim
+                )
+
+                for _ in range(num_interactions)
+
+            ]
+
+        )
+
+
+
+    def forward(
+        self,
+        z: Tensor,
+        pos: Tensor,
+        edge_index: Tensor,
+    ) -> Tensor:
+
+
+        x = self.embedding(
+            z
+        )
+
+
+        for interaction in self.interactions:
+
+
+            x = x + interaction(
+
+                x,
+
+                pos,
+
+                edge_index,
+
+            )
+
+
+        return x
+
+
+
+
+# ============================================================
+# Energy Head
+# ============================================================
+
+
+class EnergyHead(nn.Module):
+
+
+    def __init__(
+        self,
+        hidden_dim:int,
     ):
 
         super().__init__()
@@ -69,15 +329,6 @@ class EnergyHead(nn.Module):
 
             nn.Linear(
                 hidden_dim,
-                hidden_dim // 2,
-            ),
-
-
-            nn.SiLU(),
-
-
-            nn.Linear(
-                hidden_dim // 2,
                 1,
             )
 
@@ -89,20 +340,6 @@ class EnergyHead(nn.Module):
         self,
         x: Tensor,
     ) -> Tensor:
-
-        """
-        Predict energy.
-
-        Parameters
-        ----------
-        x:
-            Molecular representation.
-
-        Returns
-        -------
-        Tensor
-            Molecular energy.
-        """
 
 
         return self.network(x)
@@ -117,30 +354,8 @@ class EnergyHead(nn.Module):
 
 class HybridSchNetTransformer(nn.Module):
     """
-    Hybrid molecular neural network.
-
-    Architecture:
-
-    Atomic structure
-          |
-          v
-       SchNet
-          |
-          v
-    Transformer Encoder
-          |
-          v
-     Pooling
-          |
-          v
-       Energy
-
-
-    Forces are obtained using:
-
-    F = -grad(E)
+    Final hybrid molecular model.
     """
-
 
 
     def __init__(self):
@@ -149,27 +364,14 @@ class HybridSchNetTransformer(nn.Module):
 
 
 
-        # ----------------------------------------------------
-        # SchNet Encoder
-        # ----------------------------------------------------
+        self.encoder = SchNetEncoder(
 
-        self.schnet = SchNet(
+            config.hidden_dim,
 
-            hidden_channels=config.hidden_dim,
-
-            num_filters=config.hidden_dim,
-
-            num_interactions=config.num_interactions,
-
-            cutoff=10.0,
+            config.num_interactions,
 
         )
 
-
-
-        # ----------------------------------------------------
-        # Transformer
-        # ----------------------------------------------------
 
 
         self.transformer = TransformerEncoder(
@@ -186,11 +388,6 @@ class HybridSchNetTransformer(nn.Module):
 
 
 
-        # ----------------------------------------------------
-        # Energy predictor
-        # ----------------------------------------------------
-
-
         self.energy_head = EnergyHead(
 
             config.hidden_dim
@@ -200,33 +397,11 @@ class HybridSchNetTransformer(nn.Module):
 
 
 
-
     def forward(
         self,
         data,
-        return_forces: bool = True,
+        return_forces=True,
     ) -> Tuple[Tensor, Tensor]:
-
-        """
-        Forward pass.
-
-        Parameters
-        ----------
-        data:
-            PyTorch Geometric molecular graph.
-
-        return_forces:
-            Whether to compute forces.
-
-
-        Returns
-        -------
-        energy:
-            Predicted molecular energy.
-
-        forces:
-            Predicted atomic forces.
-        """
 
 
         z = data.z
@@ -237,66 +412,78 @@ class HybridSchNetTransformer(nn.Module):
 
 
 
-        # Enable force calculation
-
         if return_forces:
 
             pos.requires_grad_(True)
 
 
 
-        # ----------------------------------------------------
-        # SchNet
-        # ----------------------------------------------------
+        # build molecular graph
 
-        atomic_features = self.schnet(
+        edge_index = radius_graph(
+
+            pos,
+
+            r=5.0,
+
+            batch=batch,
+
+        )
+
+
+
+        # SchNet atom features
+
+        atom_features = self.encoder(
 
             z,
 
             pos,
+
+            edge_index,
+
+        )
+
+
+
+        # Transformer needs:
+
+        # [batch, atoms, features]
+
+        atom_features = atom_features.unsqueeze(0)
+
+
+
+        atom_features = self.transformer(
+
+            atom_features
+
+        )
+
+
+
+        atom_features = atom_features.squeeze(0)
+
+
+
+        # molecular representation
+
+        molecule_features = global_add_pool(
+
+            atom_features,
 
             batch,
 
         )
 
 
-        """
-        Important:
-
-        PyG SchNet already returns graph-level output.
-
-        For Transformer we need atom-level features.
-
-        Therefore, in the final implementation,
-        we will replace this with a custom SchNet
-        message passing encoder.
-
-        This placeholder keeps the architecture clean
-        while we build the custom version.
-        """
-
-
-
-        molecular_features = atomic_features
-
-
-
-        # ----------------------------------------------------
-        # Energy
-        # ----------------------------------------------------
-
 
         energy = self.energy_head(
 
-            molecular_features
+            molecule_features
 
         )
 
-
-
-        # ----------------------------------------------------
-        # Force calculation
-        # ----------------------------------------------------
 
 
         forces = None
@@ -322,26 +509,15 @@ class HybridSchNetTransformer(nn.Module):
 
 
 
-
 # ============================================================
-# Model Test
+# Test
 # ============================================================
 
 
-def test_model():
-
-    """
-    Simple forward test.
-    """
+if __name__ == "__main__":
 
 
     model = HybridSchNetTransformer()
 
 
     print(model)
-
-
-
-if __name__ == "__main__":
-
-    test_model()
